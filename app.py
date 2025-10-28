@@ -1,28 +1,20 @@
-# app.py — tuned version of YOUR working file
+# app.py — v4 "near-real-time" tuned to beat the NSE website by seconds
 
-# Changes:
+# Changes vs your working file:
 
-# - Poll every 3s by default
+# - Independent loops per source (no batching)
 
-# - Cache-buster on ALL requests (bypass CDN delays)
+# - Faster intervals (NSE 1.5s, SEBI 2s, BSE 2s)
 
-# - Faster timeouts + warm cookies for NSE
+# - Cache buster + no-cache headers on ALL requests
 
-# - Price-sensitive keywords (Option B)
+# - Snappy timeouts, warm NSE cookies
 
-# - Optional debug prints (off by default; flip DEBUG=1 env to enable)
+# - Price-sensitive filters kept (Option B)
 
-import os
+# - Optional DEBUG logs via env DEBUG=1
 
-import time
-
-import asyncio
-
-import aiohttp
-
-import feedparser
-
-import sqlite3
+import os, time, asyncio, aiohttp, feedparser, sqlite3
 
 from datetime import datetime, timezone
 
@@ -38,19 +30,21 @@ from telegram.constants import ParseMode
 
 from dateutil import parser as dtparser
 
-# ------------- Config -------------
-
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN","").strip()
 
 CHAT_IDS = [cid.strip() for cid in os.getenv("CHAT_IDS","").split(",") if cid.strip()]
 
-# Faster poll
+# Per-source intervals (seconds)
 
-POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC","3"))
+NSE_INTERVAL  = float(os.getenv("NSE_INTERVAL",  "1.5"))
 
-# Price-sensitive only (Option B)
+SEBI_INTERVAL = float(os.getenv("SEBI_INTERVAL", "2"))
+
+BSE_INTERVAL  = float(os.getenv("BSE_INTERVAL",  "2"))
+
+# Price-sensitive only (Option B). You can extend via KEYWORDS env.
 
 DEFAULT_KEYWORDS = (
 
@@ -62,9 +56,19 @@ DEFAULT_KEYWORDS = (
 
 )
 
-KEYWORDS = [k.strip().lower() for k in os.getenv("KEYWORDS", DEFAULT_KEYWORDS).split(",") if k.strip()]
+KEYWORDS    = [k.strip().lower() for k in os.getenv("KEYWORDS", DEFAULT_KEYWORDS).split(",") if k.strip()]
 
-WATCHLIST = [w.strip().lower() for w in os.getenv("WATCHLIST","").split(",") if w.strip()]
+WATCHLIST   = [w.strip().lower() for w in os.getenv("WATCHLIST","").split(",") if w.strip()]
+
+ONLY_MATCHING = os.getenv("ONLY_MATCHING","1")=="1"   # keep 1 for best “useful noise vs speed”
+
+SEND_PDF    = os.getenv("SEND_PDF","1")=="1"
+
+MAX_PDF_MB  = float(os.getenv("MAX_PDF_MB","40"))
+
+DB_PATH     = os.getenv("DB_PATH","seen.db")
+
+DEBUG       = os.getenv("DEBUG","0")=="1"
 
 ENABLE_SEBI = os.getenv("ENABLE_SEBI","1")=="1"
 
@@ -78,23 +82,13 @@ BSE_RSS  = os.getenv("BSE_RSS","https://www.bseindia.com/xml-data/corpfiling/Cor
 
 NSE_URL  = os.getenv("NSE_URL","https://www.nseindia.com/api/corporate-announcements?index=equities")
 
-SEND_PDF = os.getenv("SEND_PDF","1")=="1"
-
-MAX_PDF_MB = float(os.getenv("MAX_PDF_MB","40"))
-
-ONLY_MATCHING = os.getenv("ONLY_MATCHING","1")=="1"  # keep 1 for speed/quality
-
-DB_PATH = os.getenv("DB_PATH","seen.db")
-
-DEBUG = os.getenv("DEBUG","0")=="1"
-
 if not BOT_TOKEN: raise SystemExit("ERROR: BOT_TOKEN not set")
 
-if not CHAT_IDS: raise SystemExit("ERROR: CHAT_IDS empty")
+if not CHAT_IDS:  raise SystemExit("ERROR: CHAT_IDS empty")
 
 bot = Bot(BOT_TOKEN)
 
-# ------------- Storage -------------
+# ---------- Storage ----------
 
 def db_init():
 
@@ -138,9 +132,37 @@ def pdf_mark_sent(url):
 
     conn.commit(); conn.close()
 
-# ------------- Helpers -------------
+# ---------- Helpers ----------
 
-def match_filters(text):
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
+
+USER_HEADERS = {"User-Agent": UA, "Accept":"application/json, text/plain, */*", "Accept-Language":"en-US,en;q=0.9",
+
+                "Connection":"keep-alive", "Referer":"https://www.nseindia.com/"}
+
+def with_cache_buster(url: str) -> str:
+
+    try:
+
+        parts = list(urlparse(url))
+
+        qs = dict(parse_qsl(parts[4]))
+
+        qs["_"] = str(int(time.time() * 1000))  # ms timestamp
+
+        parts[4] = urlencode(qs)
+
+        return urlunparse(parts)
+
+    except Exception:
+
+        return url
+
+def looks_like_pdf_url(url):
+
+    return bool(url) and (url.lower().endswith(".pdf") or "pdf" in url.lower())
+
+def match_filters(text: str) -> bool:
 
     t = (text or "").lower()
 
@@ -158,7 +180,9 @@ async def notify_text(msg):
 
         try: await bot.send_message(chat_id=cid, text=msg, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
 
-        except Exception as e: print("Send text error:", e)
+        except Exception as e: 
+
+            if DEBUG: print("Send text error:", e)
 
 async def notify_pdf(caption, filename, content):
 
@@ -166,49 +190,19 @@ async def notify_pdf(caption, filename, content):
 
         try: await bot.send_document(chat_id=cid, document=content, filename=filename, caption=caption, parse_mode=ParseMode.HTML)
 
-        except Exception as e: print("Send pdf error:", e)
+        except Exception as e:
 
-UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
+            if DEBUG: print("Send pdf error:", e)
 
-USER_HEADERS = {"User-Agent": UA, "Accept":"application/json, text/plain, */*", "Accept-Language":"en-US,en;q=0.9", "Connection":"keep-alive", "Referer":"https://www.nseindia.com/"}
+# ---------- Fetchers ----------
 
-def looks_like_pdf_url(url):
-
-    if not url: return False
-
-    s = url.lower()
-
-    return s.endswith(".pdf") or "pdf" in s
-
-# NEW: cache-buster for all requests (beats CDN delays)
-
-def with_cache_buster(url: str) -> str:
-
-    try:
-
-        parts = list(urlparse(url))
-
-        qs = dict(parse_qsl(parts[4]))
-
-        qs["_"] = str(int(time.time() * 1000))   # ms timestamp
-
-        parts[4] = urlencode(qs)
-
-        return urlunparse(parts)
-
-    except Exception:
-
-        return url
-
-# ------------- Fetchers -------------
-
-@retry(stop=stop_after_attempt(5), wait=wait_exponential(min=1, max=30))
+@retry(stop=stop_after_attempt(5), wait=wait_exponential(min=0.5, max=10))
 
 async def fetch_rss(session, url):
 
     headers = {"User-Agent": UA, "Cache-Control":"no-cache, no-store", "Pragma":"no-cache"}
 
-    async with session.get(with_cache_buster(url), headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+    async with session.get(with_cache_buster(url), headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
 
         resp.raise_for_status()
 
@@ -248,21 +242,17 @@ fetch_sebi = lambda s: fetch_rss(s, SEBI_RSS)
 
 fetch_bse  = lambda s: fetch_rss(s, BSE_RSS)
 
-@retry(stop=stop_after_attempt(6), wait=wait_exponential(min=1, max=40))
+@retry(stop=stop_after_attempt(5), wait=wait_exponential(min=0.5, max=10))
 
 async def fetch_nse(session):
 
-    # warm cookies
+    async with session.get("https://www.nseindia.com/", headers=USER_HEADERS, timeout=aiohttp.ClientTimeout(total=5)) as resp:
 
-    async with session.get("https://www.nseindia.com/", headers=USER_HEADERS, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+        await resp.read()  # warm cookies
 
-        await resp.read()
+    hdrs = dict(USER_HEADERS); hdrs.update({"Cache-Control":"no-cache, no-store", "Pragma":"no-cache"})
 
-    hdrs = dict(USER_HEADERS)
-
-    hdrs.update({"Cache-Control":"no-cache, no-store", "Pragma":"no-cache"})
-
-    async with session.get(with_cache_buster(NSE_URL), headers=hdrs, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+    async with session.get(with_cache_buster(NSE_URL), headers=hdrs, timeout=aiohttp.ClientTimeout(total=8)) as resp:
 
         resp.raise_for_status()
 
@@ -294,7 +284,9 @@ async def fetch_nse(session):
 
                     items.append({"id":uid or title,"title":title or f"NSE Announcement: {comp}","summary":comp,"link":link,"published":published,"company":comp})
 
-                except: pass
+                except: 
+
+                    pass
 
         if DEBUG: print(f"[{datetime.now()}] NSE -> {len(items)}")
 
@@ -304,13 +296,13 @@ async def fetch_pdf_bytes(session, url):
 
     try:
 
-        async with session.get(with_cache_buster(url), headers=USER_HEADERS, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+        async with session.get(with_cache_buster(url), headers=USER_HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
 
             resp.raise_for_status()
 
             content = await resp.read()
 
-            if len(content)/(1024*1024) > float(os.getenv("MAX_PDF_MB","40")): return None
+            if len(content)/(1024*1024) > MAX_PDF_MB: return None
 
             ctype = resp.headers.get("Content-Type","").lower()
 
@@ -320,7 +312,11 @@ async def fetch_pdf_bytes(session, url):
 
     except Exception as e:
 
-        print("PDF fetch error:", e); return None
+        if DEBUG: print("PDF fetch error:", e)
+
+        return None
+
+# ---------- Processing ----------
 
 async def handle_item(session, source, it):
 
@@ -364,77 +360,95 @@ async def handle_item(session, source, it):
 
     seen_add(source, uid)
 
-async def poll_loop():
+# ---------- Loops per source (independent) ----------
+
+async def loop_sebi(session):
+
+    if not ENABLE_SEBI: return
+
+    while True:
+
+        try:
+
+            items = await fetch_sebi(session)
+
+            for it in reversed(items): await handle_item(session, "SEBI", it)
+
+        except Exception as e:
+
+            if DEBUG: print("SEBI loop error:", e)
+
+        await asyncio.sleep(SEBI_INTERVAL)
+
+async def loop_bse(session):
+
+    if not ENABLE_BSE: return
+
+    while True:
+
+        try:
+
+            items = await fetch_bse(session)
+
+            for it in reversed(items): await handle_item(session, "BSE", it)
+
+        except Exception as e:
+
+            if DEBUG: print("BSE loop error:", e)
+
+        await asyncio.sleep(BSE_INTERVAL)
+
+async def loop_nse(session):
+
+    if not ENABLE_NSE: return
+
+    while True:
+
+        try:
+
+            items = await fetch_nse(session)
+
+            for it in reversed(items): await handle_item(session, "NSE", it)
+
+        except Exception as e:
+
+            if DEBUG: print("NSE loop error:", e)
+
+        await asyncio.sleep(NSE_INTERVAL)
+
+# ---------- Main ----------
+
+async def main_async():
 
     db_init()
 
-    await notify_text("🟢 <b>Instant India Filings Bot (PDF)</b> started. Sources: "
+    start_msg = "🟢 <b>Instant India Filings Bot (PDF)</b> started. Sources: "
 
-                      + ", ".join(s for s,on in [("SEBI",ENABLE_SEBI),("NSE",ENABLE_NSE),("BSE",ENABLE_BSE)] if on)
+    start_msg += ", ".join(s for s,on in [("SEBI",ENABLE_SEBI),("NSE",ENABLE_NSE),("BSE",ENABLE_BSE)] if on)
 
-                      + (", PDFs ON" if os.getenv("SEND_PDF","1")=="1" else ", PDFs OFF"))
+    start_msg += ", PDFs ON" if SEND_PDF else ", PDFs OFF"
 
-    # Faster networking
+    await notify_text(start_msg)
 
-    timeout = aiohttp.ClientTimeout(total=15, connect=5, sock_read=7)
+    timeout   = aiohttp.ClientTimeout(total=10, connect=3, sock_read=5)
 
-    connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=60)
+    connector = aiohttp.TCPConnector(limit=30, ttl_dns_cache=90)
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
 
-        while True:
+        tasks = [loop for loop in (
 
-            try:
+            loop_sebi(session),
 
-                tasks=[]
+            loop_nse(session),
 
-                if ENABLE_SEBI: tasks.append(fetch_sebi(session))
+            loop_bse(session),
 
-                if ENABLE_NSE:  tasks.append(fetch_nse(session))
+        ) if loop is not None]
 
-                if ENABLE_BSE:  tasks.append(fetch_bse(session))
+        await asyncio.gather(*tasks)
 
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                idx=0
-
-                if ENABLE_SEBI:
-
-                    sebires = results[idx]; idx+=1
-
-                    if not isinstance(sebires, Exception):
-
-                        if DEBUG: print(f"[{datetime.now()}] SEBI fetched: {len(sebires)}")
-
-                        for it in reversed(sebires): await handle_item(session, "SEBI", it)
-
-                if ENABLE_NSE:
-
-                    nseres = results[idx]; idx+=1
-
-                    if not isinstance(nseres, Exception):
-
-                        if DEBUG: print(f"[{datetime.now()}] NSE fetched: {len(nseres)}")
-
-                        for it in reversed(nseres): await handle_item(session, "NSE", it)
-
-                if ENABLE_BSE:
-
-                    bseres = results[idx]; idx+=1
-
-                    if not isinstance(bseres, Exception):
-
-                        if DEBUG: print(f"[{datetime.now()}] BSE fetched: {len(bseres)}")
-
-                        for it in reversed(bseres): await handle_item(session, "BSE", it)
-
-            except Exception as e:
-
-                print("Loop error:", e)
-
-            await asyncio.sleep(POLL_INTERVAL_SEC)
-
-def main(): asyncio.run(poll_loop())
+def main(): asyncio.run(main_async())
 
 if __name__ == "__main__": main()
  
